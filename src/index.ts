@@ -559,9 +559,13 @@ export class PgBoss extends EventEmitter<types.PgBossEventMap> {
   }
 }
 
+export { systemClock } from './clock.ts'
+
 export type {
   BackendProfile,
   BackendOptions,
+  Clock,
+  ClockTimer,
   BamEntry,
   BamEvent,
   BamStatusSummary,
