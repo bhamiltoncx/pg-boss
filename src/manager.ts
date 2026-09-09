@@ -101,8 +101,8 @@ class Manager extends EventEmitter implements types.EventsMixin {
   wipTs: number
   workers: Map<string, Worker>
   stopped: boolean | undefined
-  queueCacheInterval: NodeJS.Timeout | undefined
-  wipInterval: NodeJS.Timeout | undefined
+  queueCacheInterval: types.ClockTimer | undefined
+  wipInterval: types.ClockTimer | undefined
   timekeeper: Timekeeper | undefined
   notifier: Notifier | undefined
   queues: Record<string, types.QueueResult> | null
@@ -117,7 +117,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
     this.config = config
     this.db = db
-    this.wipTs = Date.now()
+    this.wipTs = config.clock.now()
     this.workers = new Map()
     this.queues = {}
     this.pendingOffWorkCleanups = new Set()
@@ -473,12 +473,12 @@ class Manager extends EventEmitter implements types.EventsMixin {
       worker.abortController = ac
     }
 
-    let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+    let heartbeatTimer: types.ClockTimer | null = null
 
     if (heartbeatSeconds > 0) {
       const refreshSeconds = heartbeatRefreshSeconds ?? (heartbeatSeconds / 2)
       const intervalMs = refreshSeconds * 1000
-      heartbeatTimer = setInterval(async () => {
+      heartbeatTimer = this.config.clock.setInterval(async () => {
         try {
           await this.touch(name, jobIds)
         } catch (err) {
@@ -493,7 +493,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
     let didFail = false
 
     try {
-      const result = await resolveWithinSeconds(callback(jobs), maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
+      const result = await resolveWithinSeconds(this.config.clock, callback(jobs), maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
       if (perJobResults) {
         // #settlePerJob settles each job individually and does its own (synchronous,
         // lookup-free) spy tracking via #trackJobsSettled, so the deferred tracker below
@@ -509,7 +509,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
       failedError = err
       didFail = true
     } finally {
-      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      if (heartbeatTimer) this.config.clock.clearInterval(heartbeatTimer)
       if (worker) {
         // Clear between jobs
         worker.abortController = null
@@ -534,9 +534,9 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
   async start () {
     this.stopped = false
-    this.queueCacheInterval = setInterval(() => this.onCacheQueues({ emit: true }), this.config.queueCacheIntervalSeconds! * 1000)
-    this.wipInterval = setInterval(() => {
-      const now = Date.now()
+    this.queueCacheInterval = this.config.clock.setInterval(() => this.onCacheQueues({ emit: true }), this.config.queueCacheIntervalSeconds! * 1000)
+    this.wipInterval = this.config.clock.setInterval(() => {
+      const now = this.config.clock.now()
       if ((now - this.wipTs) < 2000) {
         return
       }
@@ -587,8 +587,8 @@ class Manager extends EventEmitter implements types.EventsMixin {
   async stop () {
     this.stopped = true
 
-    clearInterval(this.queueCacheInterval)
-    clearInterval(this.wipInterval)
+    this.config.clock.clearInterval(this.queueCacheInterval)
+    this.config.clock.clearInterval(this.wipInterval)
 
     await Promise.allSettled(
       [...this.workers.values()]
@@ -717,7 +717,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
         this.emit(events.error, { ...error, message: error.message, stack: error.stack, queue: name, worker: workerId })
       }
 
-      return new Worker<ReqData>({ id: workerId, workId, name, options, resolveInterval, fetch, onFetch, onError })
+      return new Worker<ReqData>({ id: workerId, workId, name, options, resolveInterval, fetch, onFetch, onError, clock: this.config.clock })
     }
 
     // Spawn workers based on localConcurrency setting
@@ -746,7 +746,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
   private emitWip (name: string) {
     if (!INTERNAL_QUEUES[name]) {
-      const now = Date.now()
+      const now = this.config.clock.now()
 
       if (now - this.wipTs > 2000) {
         this.emit(events.wip, this.getWipData())
@@ -1347,7 +1347,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
   getDebounceStartAfter (singletonSeconds: number, clockOffset: number) {
     const debounceInterval = singletonSeconds * 1000
 
-    const now = Date.now() + clockOffset
+    const now = this.config.clock.now() + clockOffset
 
     const slot = Math.floor(now / debounceInterval) * debounceInterval
 
@@ -1638,14 +1638,14 @@ class Manager extends EventEmitter implements types.EventsMixin {
         // Calculate start_after for retry
         let startAfter = job.start_after
         if (!job.retry_backoff) {
-          startAfter = new Date(Date.now() + retryDelay * 1000)
+          startAfter = new Date(this.config.clock.now() + retryDelay * 1000)
         } else {
           const exp = Math.min(16, retryCount + 1)
           const delay = Math.max(retryDelay, 1) * (Math.pow(2, exp) / 2 + Math.pow(2, exp) / 2 * Math.random())
           // Match the canonical failJobs() SQL: LEAST(retry_delay_max, delay) caps the backoff,
           // treating NULL as "no cap" and 0 as a real cap. (`?:` would wrongly treat 0 as no cap.)
           const cappedDelay = retryDelayMax != null ? Math.min(retryDelayMax, delay) : delay
-          startAfter = new Date(Date.now() + cappedDelay * 1000)
+          startAfter = new Date(this.config.clock.now() + cappedDelay * 1000)
         }
 
         // heartbeat_on resets to NULL on re-insert; heartbeat_seconds/blocked/blocking/
@@ -1671,7 +1671,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
           job.id, job.name, job.priority, job.data, 'failed', job.retry_limit, job.retry_count,
           job.retry_delay, job.retry_backoff, job.retry_delay_max, job.start_after, job.started_on,
           job.singleton_key, job.singleton_on, job.group_id, job.group_tier, job.expire_seconds,
-          job.deletion_seconds, job.created_on, new Date(), job.keep_until, job.policy,
+          job.deletion_seconds, job.created_on, new Date(this.config.clock.now()), job.keep_until, job.policy,
           jobOutput, job.dead_letter,
           null, job.heartbeat_seconds, job.blocked, job.blocking, job.pending_dependencies
         ])
@@ -1937,7 +1937,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
         activeCount: 0,
         failedCount: 0,
         totalCount: 0,
-        capturedOn: row?.capturedOn ?? new Date()
+        capturedOn: row?.capturedOn ?? new Date(this.config.clock.now())
       }
 
       for (const field of STATS_COUNT_FIELDS) {
@@ -2007,7 +2007,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
     const cacheAgeMs = cached.capturedOn == null
       ? Infinity
-      : Date.now() - new Date(cached.capturedOn).getTime()
+      : this.config.clock.now() - new Date(cached.capturedOn).getTime()
 
     // The vacuum-safety backoff outranks staleness, including a caller's { force: true }. Refreshing
     // here runs the same whole-job-table aggregate the supervisor just backed away from, and a
